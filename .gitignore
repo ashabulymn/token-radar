@@ -1,2 +1,5 @@
+# Build outputs: the entrypoint writes these when it runs; they are never committed.
 out/
 out2/
+# Third-party code, if any is ever installed (the entry uses the standard library only).
+node_modules/
