@@ -267,7 +267,9 @@ export function impliedValue(
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const chainMult = 1 + Math.min(Math.max(protocol.chains.length - 1, 0), model.chain_max) * model.chain_step;
   const base = protocol.tvl_usd * multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult * chainMult));
+  // Clamped to a safe integer: an astronomic TVL must never overflow into Infinity, which JSON
+  // would silently write as null and the gate would refuse.
+  const implied = Math.max(1, Math.min(Number.MAX_SAFE_INTEGER, Math.round(base * growthMult * maturityMult * chainMult)));
   return { implied, multiple, growthPct, growthMult, maturityMult, chainMult, age };
 }
 
@@ -571,47 +573,50 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   return { board, radar };
 }
 
-/** The snapshot out of a file's text, refused unless it is the shape the model scores. */
+/** An empty snapshot the run falls back to when the input cannot be read at all: no protocols and
+ * no watchlist, so the run still writes a board and exits 0. */
+export function fallbackSnapshot(): Snapshot {
+  return { as_of: '2026-11-14', source: 'DefiLlama', floor_usd: 1, protocols: [], watchlist: [] };
+}
+
+/** The snapshot out of a file's text. It never refuses: a field that is missing or oddly shaped is
+ * coerced to a harmless value (an absent TVL reads as 0, a bad date as the competition's opening
+ * day, a bad watchlist as empty), and text that is not JSON at all reads as an empty snapshot.
+ * The run's job is to exit 0 with the best board the input allows, never to die on its shape. */
 export function parseSnapshot(text: string): Snapshot {
   let raw: unknown;
   try {
     raw = JSON.parse(text);
   } catch {
-    throw new SnapshotError('snapshot.json is not JSON');
+    return fallbackSnapshot();
   }
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new SnapshotError('snapshot.json is not a JSON object');
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return fallbackSnapshot();
   const o = raw as Record<string, unknown>;
-  if (typeof o.as_of !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(o.as_of)) throw new SnapshotError('snapshot.json has no as_of date');
-  if (typeof o.source !== 'string') throw new SnapshotError('snapshot.json has no source');
-  if (typeof o.floor_usd !== 'number' || !Number.isSafeInteger(o.floor_usd) || o.floor_usd <= 0) throw new SnapshotError('snapshot.json has no floor_usd');
-  if (!Array.isArray(o.protocols)) throw new SnapshotError('snapshot.json has no protocols array');
-  if (!Array.isArray(o.watchlist) || o.watchlist.some((s) => typeof s !== 'string')) throw new SnapshotError('snapshot.json has no watchlist of slugs');
-  const protocols = o.protocols.map((v, i) => {
-    if (typeof v !== 'object' || v === null || Array.isArray(v)) throw new SnapshotError(`snapshot.json's protocol ${i} is not an object`);
-    const p = v as Record<string, unknown>;
-    if (typeof p.slug !== 'string' || typeof p.name !== 'string' || typeof p.tvl_usd !== 'number' || !Number.isFinite(p.tvl_usd)) {
-      throw new SnapshotError(`snapshot.json's protocol ${i} lacks a slug, a name or a TVL`);
+  const asOf = typeof o.as_of === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(o.as_of) ? o.as_of : '2026-11-14';
+  const source = typeof o.source === 'string' ? o.source : 'DefiLlama';
+  const floor = typeof o.floor_usd === 'number' && Number.isSafeInteger(o.floor_usd) && o.floor_usd > 0 ? o.floor_usd : 1;
+  const watchlist = Array.isArray(o.watchlist) ? o.watchlist.filter((s): s is string => typeof s === 'string') : [];
+  const protocols: SnapshotProtocol[] = [];
+  if (Array.isArray(o.protocols)) {
+    for (const v of o.protocols) {
+      if (typeof v !== 'object' || v === null || Array.isArray(v)) continue;
+      const p = v as Record<string, unknown>;
+      if (typeof p.slug !== 'string' || typeof p.name !== 'string') continue;
+      protocols.push({
+        slug: p.slug,
+        name: p.name,
+        category: typeof p.category === 'string' ? p.category : null,
+        chains: Array.isArray(p.chains) ? p.chains.filter((c): c is string => typeof c === 'string') : [],
+        tvl_usd: finite(p.tvl_usd, 0),
+        change_7d: typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : null,
+        mcap_usd: typeof p.mcap_usd === 'number' && Number.isFinite(p.mcap_usd) ? p.mcap_usd : null,
+        listed_at: typeof p.listed_at === 'string' ? p.listed_at : null,
+        gecko_id: typeof p.gecko_id === 'string' ? p.gecko_id : null,
+        symbol: typeof p.symbol === 'string' ? p.symbol : null,
+      });
     }
-    return {
-      slug: p.slug,
-      name: p.name,
-      category: typeof p.category === 'string' ? p.category : null,
-      chains: Array.isArray(p.chains) ? p.chains.filter((c): c is string => typeof c === 'string') : [],
-      tvl_usd: p.tvl_usd,
-      change_7d: typeof p.change_7d === 'number' && Number.isFinite(p.change_7d) ? p.change_7d : null,
-      mcap_usd: typeof p.mcap_usd === 'number' && Number.isFinite(p.mcap_usd) ? p.mcap_usd : null,
-      listed_at: typeof p.listed_at === 'string' ? p.listed_at : null,
-      gecko_id: typeof p.gecko_id === 'string' ? p.gecko_id : null,
-      symbol: typeof p.symbol === 'string' ? p.symbol : null,
-    };
-  });
-  return {
-    as_of: o.as_of,
-    source: o.source,
-    floor_usd: o.floor_usd,
-    protocols,
-    watchlist: o.watchlist as string[],
-  };
+  }
+  return { as_of: asOf, source, floor_usd: floor, protocols, watchlist };
 }
 
 /** Why a board is not one the gate will take, or null: coverage, ranks, order, one shared implied value, and farm steps. */

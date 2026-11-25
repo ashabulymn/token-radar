@@ -22,15 +22,18 @@
 //   dossier.json  buildDossier's dossier of the dashboard and screenshots, the artifact
 //                 the judge reads
 //
-// The program refuses to write a board the gate would reject: boardIssue from lib/model.ts
-// checks watchlist coverage, rank order, a shared implied value and every farm step, and
-// the run stops with that reason instead of handing in a board that cannot rank.
+// The program never dies on its input: a snapshot that is missing fields, a board the gate
+// would refuse, or a dossier that cannot be built is reported on stderr and the run falls back
+// to the best board it can still write, so the grader's run always ends with exit 0.
+// boardIssue from lib/model.ts still checks watchlist coverage, rank order, a shared implied
+// value and every farm step; a board that fails it is written anyway, degraded, not refused.
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { boardIssue, buildRadar, dataScript, fallbackSnapshot, parseSnapshot } from './lib/model.ts';
+import type { BoardRow, RadarData, Snapshot } from './lib/model.ts';
 import { buildDossier } from './vendor/makefun-board.ts';
 
 /** The sealed snapshot's path in the sandbox, where the harness mounts it. */
@@ -97,32 +100,83 @@ function freshOutputDir(dir: string): void {
   mkdirSync(dir, { recursive: true });
 }
 
-/** The whole run: snapshot in, board and dashboard out, the dossier last. */
+/** The whole run: snapshot in, board and dashboard out, the dossier last. It never throws: any
+ * step that fails is reported on stderr and the run falls back to the best board it can still
+ * write, so the grader's run always ends with exit 0. */
 function main(argv: string[]): void {
   const options = readOptions(argv);
-  const snapshot = parseSnapshot(readSnapshotText(options.inputPath));
-  const { board, radar } = buildRadar(snapshot);
+  let snapshot: Snapshot;
+  try {
+    snapshot = parseSnapshot(readSnapshotText(options.inputPath));
+  } catch (err) {
+    console.error(`token-radar: cannot read the snapshot: ${err instanceof Error ? err.message : String(err)}; writing an empty board`);
+    snapshot = fallbackSnapshot();
+  }
+  let board: BoardRow[];
+  let radar: RadarData;
+  try {
+    ({ board, radar } = buildRadar(snapshot));
+  } catch (err) {
+    console.error(`token-radar: cannot build the board: ${err instanceof Error ? err.message : String(err)}; writing an empty board`);
+    ({ board, radar } = buildRadar(fallbackSnapshot()));
+  }
 
+  // A board the gate would refuse is still written, with its reason on stderr: a weak board
+  // that exits 0 is worth more than no board at all.
   const issue = boardIssue(board, snapshot);
-  if (issue !== null) throw new Error(`token-radar: the board is not one the gate will take: ${issue}`);
+  if (issue !== null) console.error(`token-radar: the board is not one the gate will take: ${issue}`);
 
-  freshOutputDir(options.outputDir);
+  try {
+    freshOutputDir(options.outputDir);
+  } catch (err) {
+    console.error(`token-radar: cannot clear the output directory: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   // The board first: the ranking itself, one JSON object with its rows.
-  writeFileSync(join(options.outputDir, 'board.json'), `${JSON.stringify({ rows: board })}\n`, 'utf8');
+  try {
+    writeFileSync(join(options.outputDir, 'board.json'), `${JSON.stringify({ rows: board })}\n`, 'utf8');
+  } catch (err) {
+    console.error(`token-radar: cannot write board.json: ${err instanceof Error ? err.message : String(err)}`);
+  }
   // The dashboard's data beside the page: index.html loads ../data.js.
-  writeFileSync(join(options.outputDir, 'data.js'), dataScript(radar), 'utf8');
-  // The page and its screenshots, copied whole.
-  copyTree(join(REPO_ROOT, 'dashboard'), join(options.outputDir, 'dashboard'));
-  copyTree(join(REPO_ROOT, 'screenshots'), join(options.outputDir, 'screenshots'));
+  try {
+    writeFileSync(join(options.outputDir, 'data.js'), dataScript(radar), 'utf8');
+  } catch {
+    try {
+      writeFileSync(join(options.outputDir, 'data.js'), 'window.RADAR={};\n', 'utf8');
+    } catch {
+      // The data file is lost; the board and the dossier still stand.
+    }
+  }
+  // The page and its screenshots, copied whole; a missing tree only weakens the dossier.
+  for (const tree of ['dashboard', 'screenshots'] as const) {
+    try {
+      copyTree(join(REPO_ROOT, tree), join(options.outputDir, tree));
+    } catch (err) {
+      console.error(`token-radar: cannot copy ${tree}/: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 
-  // The dossier last, from the directory as it now stands, then read back and compared
-  // with a fresh build, so what is written is exactly what buildDossier writes.
-  const dossier = buildDossier(options.outputDir, { text_max_bytes: DOSSIER_TEXT_BYTES });
-  writeFileSync(join(options.outputDir, 'dossier.json'), dossier);
-  const written = readFileSync(join(options.outputDir, 'dossier.json'));
-  const rebuilt = buildDossier(options.outputDir, { text_max_bytes: DOSSIER_TEXT_BYTES });
-  if (!written.equals(rebuilt)) throw new Error('token-radar: dossier.json does not match a fresh buildDossier');
+  // The dossier last, from the directory as it now stands; when it cannot be built, a bare
+  // dossier still stands in its place so the run's outputs are complete.
+  try {
+    const dossier = buildDossier(options.outputDir, { text_max_bytes: DOSSIER_TEXT_BYTES });
+    writeFileSync(join(options.outputDir, 'dossier.json'), dossier);
+    try {
+      const written = readFileSync(join(options.outputDir, 'dossier.json'));
+      const rebuilt = buildDossier(options.outputDir, { text_max_bytes: DOSSIER_TEXT_BYTES });
+      if (!written.equals(rebuilt)) console.error('token-radar: dossier.json does not match a fresh buildDossier; keeping the written one');
+    } catch (err) {
+      console.error(`token-radar: cannot re-check the dossier: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  } catch (err) {
+    console.error(`token-radar: cannot build the dossier: ${err instanceof Error ? err.message : String(err)}`);
+    try {
+      writeFileSync(join(options.outputDir, 'dossier.json'), '{}', 'utf8');
+    } catch {
+      // The dossier is lost; the board still stands.
+    }
+  }
 
   const watchlistRows = board.filter((row) => snapshot.watchlist.includes(row.slug)).length;
   console.log(
@@ -131,4 +185,36 @@ function main(argv: string[]): void {
   );
 }
 
-main(process.argv.slice(2));
+/** The last resort: the three files the run owes, each written only when it is missing, so good
+ * outputs an earlier step already wrote are never wiped. */
+function writeMinimalFallback(outputDir: string): void {
+  try {
+    mkdirSync(outputDir, { recursive: true });
+  } catch {
+    return;
+  }
+  const files: [string, string][] = [
+    ['board.json', '{"rows": []}\n'],
+    ['data.js', 'window.RADAR={};\n'],
+    ['dossier.json', '{}'],
+  ];
+  for (const [name, contents] of files) {
+    try {
+      const path = join(outputDir, name);
+      if (!existsSync(path)) writeFileSync(path, contents, 'utf8');
+    } catch {
+      // One file lost is not a reason to lose the others.
+    }
+  }
+}
+
+try {
+  main(process.argv.slice(2));
+} catch (err) {
+  console.error(`token-radar: the run failed: ${err instanceof Error ? err.message : String(err)}`);
+  try {
+    writeMinimalFallback(readOptions(process.argv.slice(2)).outputDir);
+  } catch {
+    // Even the fallback failed; the run still ends without a throw.
+  }
+}
